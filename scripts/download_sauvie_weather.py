@@ -343,6 +343,7 @@ def write_raw_manifest(rows: list[dict[str, object]]) -> None:
                 "bytes",
                 "sha256",
             ],
+            lineterminator="\n",
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -351,7 +352,9 @@ def write_raw_manifest(rows: list[dict[str, object]]) -> None:
 def write_output(rows: list[dict[str, object]]) -> None:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=OUTPUT_FIELDS)
+        writer = csv.DictWriter(
+            file, fieldnames=OUTPUT_FIELDS, lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(rows)
 
