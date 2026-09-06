@@ -9,6 +9,7 @@ import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from statistics import median
 
 import duckdb
 import pandas as pd
@@ -89,6 +90,28 @@ DAILY_ALIASES = {
     "Flight's End": "Flights End",
     "Flights End": "Flights End",
 }
+
+RESERVATION_CHOICES = [
+    "Aaron",
+    "Dead Willow",
+    "Footbridge",
+    "Hunt Unit",
+    "Johnson",
+    "Malarky",
+    "McNary",
+    "Mudhen",
+    "Pope",
+    "Racetrack",
+    "Rentenaar",
+    "Stutzer",
+    "Oak Island 1",
+    "Oak Island 2",
+    "Oak Island 3",
+    "Oak Island 4",
+    "Oak Island 5",
+    "Oak Island 6",
+    "Reeder Tract",
+]
 
 
 def read_manifest() -> pd.DataFrame:
@@ -275,6 +298,127 @@ def harvest_frame(manifest: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def parse_reservation_reports(manifest: pd.DataFrame) -> pd.DataFrame:
+    reports = manifest.loc[
+        manifest["category"] == "first_choice_applications"
+    ]
+    rows: list[dict[str, object]] = []
+    date_pattern = re.compile(
+        r"(?:(Oct|Nov|Dec|Jan)\.?\s*)?(\d{1,2})\*?"
+    )
+    month_numbers = {"Oct": 10, "Nov": 11, "Dec": 12, "Jan": 1}
+
+    for report in reports.itertuples():
+        source_path = ROOT / report.local_path
+        lines = (
+            PdfReader(source_path)
+            .pages[0]
+            .extract_text(extraction_mode="layout")
+            .splitlines()
+        )
+        header = max(
+            lines,
+            key=lambda line: len(
+                re.findall(r"(?:Oct|Nov|Dec|Jan)\.?\s*\d+", line)
+            ),
+        )
+        date_section_start = header.find("Day") + len("Day")
+        date_matches = list(
+            date_pattern.finditer(header[date_section_start:])
+        )
+        if not date_matches:
+            raise ValueError(f"No reservation dates in {source_path}")
+
+        centers = [
+            date_section_start + match.start() + len(match.group()) / 2
+            for match in date_matches
+        ]
+        spacing = median(
+            right - left for left, right in zip(centers, centers[1:])
+        )
+        boundaries = [centers[0] - spacing / 2]
+        boundaries.extend(
+            (left + right) / 2
+            for left, right in zip(centers, centers[1:])
+        )
+        boundaries.append(centers[-1] + spacing / 2)
+
+        start_year = int(report.season[:4])
+        dates = []
+        current_month: int | None = None
+        for match in date_matches:
+            if match.group(1):
+                current_month = month_numbers[match.group(1)]
+            if current_month is None:
+                raise ValueError(f"Missing month in {source_path}")
+            year = start_year + (1 if current_month == 1 else 0)
+            dates.append(
+                datetime(year, current_month, int(match.group(2))).date()
+            )
+
+        period_match = re.search(r"period-([a-g])", report.local_path)
+        if not period_match:
+            raise ValueError(f"Missing hunt period in {source_path}")
+        hunt_period = period_match.group(1).upper()
+
+        for choice in RESERVATION_CHOICES:
+            candidates = [
+                line
+                for line in lines
+                if line.lstrip().startswith(f"{choice} ")
+            ]
+            if not candidates:
+                raise ValueError(f"Missing {choice} row in {source_path}")
+            line = max(candidates, key=lambda value: len(re.findall(r"\d+", value)))
+            prefix = line[: round(boundaries[0])]
+            choice_start = prefix.find(choice)
+            capacity_values = re.findall(
+                r"\d+", prefix[choice_start + len(choice) :]
+            )
+            if len(capacity_values) != 1:
+                raise ValueError(
+                    f"Unexpected capacity for {choice} in {source_path}"
+                )
+            capacity = int(capacity_values[0])
+
+            application_values = []
+            for left, right in zip(boundaries, boundaries[1:]):
+                cell_values = re.findall(r"\d+", line[round(left) : round(right)])
+                if len(cell_values) > 1:
+                    raise ValueError(
+                        f"Unexpected application cell for {choice} "
+                        f"in {source_path}"
+                    )
+                application_values.append(
+                    int(cell_values[0]) if cell_values else 0
+                )
+
+            normalized_choice = {
+                "Hunt Unit": "Hunt",
+                "Pope": "Pope Lake",
+            }.get(choice, choice)
+            for hunt_date, applications in zip(dates, application_values):
+                rows.append(
+                    {
+                        "season": report.season,
+                        "hunt_period": hunt_period,
+                        "hunt_date": hunt_date,
+                        "unit_choice": normalized_choice,
+                        "reservations_available": capacity,
+                        "first_choice_applicants": applications,
+                        "source_path": report.local_path,
+                    }
+                )
+
+    frame = pd.DataFrame(rows).sort_values(
+        ["season", "hunt_date", "unit_choice"]
+    )
+    key = ["season", "hunt_date", "unit_choice"]
+    if frame.duplicated(key).any():
+        raise ValueError("Duplicate reservation application rows")
+    return frame
+
+
 def weather_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
     weather = pd.read_csv(WEATHER_CSV, parse_dates=["hunt_date"])
     manifest = pd.read_csv(WEATHER_ROOT / "manifest.csv")
@@ -297,6 +441,7 @@ def weather_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
 def build_database() -> None:
     manifest = read_manifest()
     harvest = harvest_frame(manifest)
+    reservations = parse_reservation_reports(manifest)
     weather, weather_raw = weather_frames()
     DATABASE.parent.mkdir(parents=True, exist_ok=True)
     DATABASE.unlink(missing_ok=True)
@@ -306,6 +451,7 @@ def build_database() -> None:
     connection.register("weather_df", weather)
     connection.register("odfw_manifest_df", manifest)
     connection.register("weather_raw_df", weather_raw)
+    connection.register("reservations_df", reservations)
 
     connection.execute(
         """
@@ -326,6 +472,17 @@ def build_database() -> None:
 
         CREATE TABLE hunt_day_weather AS SELECT * FROM weather_df;
         CREATE TABLE odfw_source_manifest AS SELECT * FROM odfw_manifest_df;
+
+        CREATE TABLE reservation_first_choice_application AS
+        SELECT
+            season::VARCHAR AS season,
+            hunt_period::VARCHAR AS hunt_period,
+            hunt_date::DATE AS hunt_date,
+            unit_choice::VARCHAR AS unit_choice,
+            reservations_available::INTEGER AS reservations_available,
+            first_choice_applicants::INTEGER AS first_choice_applicants,
+            source_path::VARCHAR AS source_path
+        FROM reservations_df;
 
         CREATE TABLE weather_raw_response AS
         SELECT
@@ -383,10 +540,19 @@ def build_database() -> None:
         FROM odfw_source_manifest
         WHERE category = 'first_choice_applications';
 
+        CREATE VIEW reservation_first_choice_demand AS
+        SELECT
+            *,
+            first_choice_applicants::DOUBLE
+                / NULLIF(reservations_available, 0) AS applicants_per_reservation
+        FROM reservation_first_choice_application;
+
         CREATE INDEX harvest_date_index
             ON harvest_daily_unit (season, hunt_date);
         CREATE INDEX harvest_unit_index
             ON harvest_daily_unit (area, unit);
+        CREATE INDEX reservation_date_index
+            ON reservation_first_choice_application (season, hunt_date);
         """
     )
 
@@ -395,6 +561,7 @@ def build_database() -> None:
             ("built_by", "scripts/build_database.py"),
             ("harvest_seasons", "2021-22 through 2025-26"),
             ("harvest_daily_unit_rows", str(len(harvest))),
+            ("reservation_application_rows", str(len(reservations))),
             ("hunt_day_weather_rows", str(len(weather))),
             (
                 "opening_weather_definition",
@@ -412,13 +579,16 @@ def build_database() -> None:
         SELECT
             (SELECT COUNT(*) FROM harvest_daily_unit) AS harvest_rows,
             (SELECT COUNT(*) FROM hunt_day_weather) AS weather_rows,
-            (SELECT COUNT(*) FROM odfw_source_manifest) AS source_rows
+            (SELECT COUNT(*) FROM odfw_source_manifest) AS source_rows,
+            (SELECT COUNT(*) FROM reservation_first_choice_application)
+                AS reservation_rows
         """
     ).fetchone()
     connection.close()
     print(
         f"Built {DATABASE} with {summary[0]} harvest rows, "
-        f"{summary[1]} weather rows, and {summary[2]} ODFW sources"
+        f"{summary[1]} weather rows, {summary[2]} ODFW sources, and "
+        f"{summary[3]} reservation application rows"
     )
 
 

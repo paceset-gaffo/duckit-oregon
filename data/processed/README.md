@@ -14,6 +14,9 @@ python3 scripts/build_database.py
 - `hunt_day_weather`: Opening-time and daily weather for all 256 hunt dates.
 - `odfw_source_manifest`: Metadata, source URLs, and checksums for all 302 ODFW
   documents.
+- `reservation_first_choice_application`: First-choice applicant counts and
+  reservations available for every choice and date in the 35 reservation
+  reports. Oak Island blind choices 1-6 remain separate.
 - `weather_raw_response`: The five original Open-Meteo API responses as JSON.
 - `database_metadata`: Build and methodology metadata.
 
@@ -26,6 +29,8 @@ python3 scripts/build_database.py
 - `harvest_with_weather`: Unit harvest records joined to hunt-day weather.
 - `reservation_report_sources`: The 35 archived first-choice application
   reports.
+- `reservation_first_choice_demand`: Application rows with applicants per
+  available reservation.
 
 The unit extraction uses ODFW's compiled duck table for 2021-22 through
 2024-25 and the first-page unit summary in each 2025-26 daily report. The
