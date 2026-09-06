@@ -6,3 +6,4 @@ nbconvert==7.17.1
 numpy==2.5.2
 pandas==3.0.5
 pypdf==6.17.0
+requests==2.34.2

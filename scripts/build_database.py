@@ -23,6 +23,8 @@ WEATHER_ROOT = ROOT / "data" / "raw" / "open-meteo" / "sauvie-island"
 WEATHER_CSV = (
     ROOT / "data" / "processed" / "sauvie-island" / "hunt-day-weather.csv"
 )
+SPORTS_ROOT = ROOT / "data" / "raw" / "espn" / "football-schedules"
+SPORTS_CSV = ROOT / "data" / "processed" / "sports" / "football-games.csv"
 DATABASE = ROOT / "data" / "processed" / "duckit_oregon.duckdb"
 COMPILED_HARVEST = (
     ODFW_ROOT
@@ -438,11 +440,18 @@ def weather_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
     return weather, pd.DataFrame(raw_rows)
 
 
+def sports_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
+    games = pd.read_csv(SPORTS_CSV)
+    manifest = pd.read_csv(SPORTS_ROOT / "manifest.csv")
+    return games, manifest
+
+
 def build_database() -> None:
     manifest = read_manifest()
     harvest = harvest_frame(manifest)
     reservations = parse_reservation_reports(manifest)
     weather, weather_raw = weather_frames()
+    games, sports_manifest = sports_frames()
     DATABASE.parent.mkdir(parents=True, exist_ok=True)
     DATABASE.unlink(missing_ok=True)
 
@@ -452,6 +461,8 @@ def build_database() -> None:
     connection.register("odfw_manifest_df", manifest)
     connection.register("weather_raw_df", weather_raw)
     connection.register("reservations_df", reservations)
+    connection.register("games_df", games)
+    connection.register("sports_manifest_df", sports_manifest)
 
     connection.execute(
         """
@@ -492,6 +503,44 @@ def build_database() -> None:
             sha256::VARCHAR AS sha256,
             response_json::JSON AS response_json
         FROM weather_raw_df;
+
+        CREATE TABLE football_game AS
+        SELECT
+            team::VARCHAR AS team,
+            team_slug::VARCHAR AS team_slug,
+            league::VARCHAR AS league,
+            football_season::INTEGER AS football_season,
+            season_type::INTEGER AS season_type,
+            season_type_name::VARCHAR AS season_type_name,
+            event_id::VARCHAR AS event_id,
+            event_name::VARCHAR AS event_name,
+            short_name::VARCHAR AS short_name,
+            game_datetime_utc::TIMESTAMPTZ AS game_datetime_utc,
+            game_datetime_pacific::TIMESTAMPTZ AS game_datetime_pacific,
+            game_date_pacific::DATE AS game_date_pacific,
+            kickoff_time_pacific::VARCHAR AS kickoff_time_pacific,
+            time_valid::BOOLEAN AS time_valid,
+            week::INTEGER AS week,
+            home_away::VARCHAR AS home_away,
+            opponent_id::VARCHAR AS opponent_id,
+            opponent::VARCHAR AS opponent,
+            opponent_abbreviation::VARCHAR AS opponent_abbreviation,
+            team_score::INTEGER AS team_score,
+            opponent_score::INTEGER AS opponent_score,
+            result::VARCHAR AS result,
+            completed::BOOLEAN AS completed,
+            status::VARCHAR AS status,
+            neutral_site::BOOLEAN AS neutral_site,
+            venue::VARCHAR AS venue,
+            venue_city::VARCHAR AS venue_city,
+            venue_state::VARCHAR AS venue_state,
+            broadcasts::VARCHAR AS broadcasts,
+            notes::VARCHAR AS notes,
+            source_url::VARCHAR AS source_url
+        FROM games_df;
+
+        CREATE TABLE sports_source_manifest AS
+        SELECT * FROM sports_manifest_df;
 
         CREATE VIEW weekly_unit_harvest AS
         SELECT
@@ -547,12 +596,83 @@ def build_database() -> None:
                 / NULLIF(reservations_available, 0) AS applicants_per_reservation
         FROM reservation_first_choice_application;
 
+        CREATE VIEW sports_on_hunt_date AS
+        SELECT
+            dates.season AS hunt_season,
+            dates.hunt_date,
+            games.*
+        FROM (
+            SELECT DISTINCT season, hunt_date
+            FROM harvest_daily_unit
+        ) AS dates
+        INNER JOIN football_game AS games
+            ON dates.hunt_date = games.game_date_pacific;
+
+        CREATE VIEW hunt_day_sports_comparison AS
+        WITH harvest AS (
+            SELECT
+                season,
+                hunt_date,
+                MIN(season_week) AS season_week,
+                SUM(hunters) AS hunters,
+                SUM(ducks) AS ducks
+            FROM harvest_daily_unit
+            GROUP BY season, hunt_date
+        ),
+        applications AS (
+            SELECT
+                season,
+                hunt_date,
+                SUM(first_choice_applicants) AS first_choice_applicants,
+                SUM(reservations_available) AS reservations_available
+            FROM reservation_first_choice_application
+            GROUP BY season, hunt_date
+        ),
+        games AS (
+            SELECT
+                hunt_date,
+                COUNT(*) AS game_count,
+                STRING_AGG(team, ', ' ORDER BY team) AS teams_playing,
+                BOOL_OR(team_slug = 'oregon') AS oregon_game,
+                BOOL_OR(team_slug = 'oregon-state') AS oregon_state_game,
+                BOOL_OR(team_slug = 'seattle-seahawks') AS seahawks_game
+            FROM sports_on_hunt_date
+            GROUP BY hunt_date
+        )
+        SELECT
+            harvest.season,
+            harvest.hunt_date,
+            harvest.season_week,
+            STRFTIME(harvest.hunt_date, '%A') AS weekday,
+            harvest.hunters::INTEGER AS hunters,
+            harvest.ducks::INTEGER AS ducks,
+            harvest.ducks::DOUBLE / NULLIF(harvest.hunters, 0)
+                AS ducks_per_hunter,
+            applications.first_choice_applicants::INTEGER
+                AS first_choice_applicants,
+            applications.reservations_available::INTEGER
+                AS reservations_available,
+            applications.first_choice_applicants::DOUBLE
+                / NULLIF(applications.reservations_available, 0)
+                AS applicants_per_reservation,
+            COALESCE(games.game_count, 0)::INTEGER AS game_count,
+            COALESCE(games.teams_playing, '') AS teams_playing,
+            COALESCE(games.oregon_game, FALSE) AS oregon_game,
+            COALESCE(games.oregon_state_game, FALSE) AS oregon_state_game,
+            COALESCE(games.seahawks_game, FALSE) AS seahawks_game,
+            COALESCE(games.game_count, 0) > 0 AS any_tracked_game
+        FROM harvest
+        INNER JOIN applications USING (season, hunt_date)
+        LEFT JOIN games USING (hunt_date);
+
         CREATE INDEX harvest_date_index
             ON harvest_daily_unit (season, hunt_date);
         CREATE INDEX harvest_unit_index
             ON harvest_daily_unit (area, unit);
         CREATE INDEX reservation_date_index
             ON reservation_first_choice_application (season, hunt_date);
+        CREATE INDEX football_game_date_index
+            ON football_game (game_date_pacific, team_slug);
         """
     )
 
@@ -563,6 +683,7 @@ def build_database() -> None:
             ("harvest_daily_unit_rows", str(len(harvest))),
             ("reservation_application_rows", str(len(reservations))),
             ("hunt_day_weather_rows", str(len(weather))),
+            ("football_game_rows", str(len(games))),
             (
                 "opening_weather_definition",
                 "nearest hourly sample to 30 minutes before local sunrise",
@@ -581,14 +702,16 @@ def build_database() -> None:
             (SELECT COUNT(*) FROM hunt_day_weather) AS weather_rows,
             (SELECT COUNT(*) FROM odfw_source_manifest) AS source_rows,
             (SELECT COUNT(*) FROM reservation_first_choice_application)
-                AS reservation_rows
+                AS reservation_rows,
+            (SELECT COUNT(*) FROM football_game) AS football_game_rows
         """
     ).fetchone()
     connection.close()
     print(
         f"Built {DATABASE} with {summary[0]} harvest rows, "
         f"{summary[1]} weather rows, {summary[2]} ODFW sources, and "
-        f"{summary[3]} reservation application rows"
+        f"{summary[3]} reservation application rows, and "
+        f"{summary[4]} football team-game rows"
     )
 
 

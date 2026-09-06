@@ -17,6 +17,10 @@ python3 scripts/build_database.py
 - `reservation_first_choice_application`: First-choice applicant counts and
   reservations available for every choice and date in the 35 reservation
   reports. Oak Island blind choices 1-6 remain separate.
+- `football_game`: Oregon, Oregon State, and Seattle Seahawks regular- and
+  postseason games for the 2021 through 2025 football seasons.
+- `sports_source_manifest`: Source URLs and checksums for the 30 archived ESPN
+  schedule responses.
 - `weather_raw_response`: The five original Open-Meteo API responses as JSON.
 - `database_metadata`: Build and methodology metadata.
 
@@ -31,6 +35,9 @@ python3 scripts/build_database.py
   reports.
 - `reservation_first_choice_demand`: Application rows with applicants per
   available reservation.
+- `sports_on_hunt_date`: Football games whose Pacific date matches a hunt date.
+- `hunt_day_sports_comparison`: One record per hunt date with application
+  demand, harvest totals, efficiency, and team game-day flags.
 
 The unit extraction uses ODFW's compiled duck table for 2021-22 through
 2024-25 and the first-page unit summary in each 2025-26 daily report. The
